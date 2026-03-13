@@ -1,0 +1,1510 @@
+#include <FS.h>        // 🔥 BU SATIRI EN ÜSTE EKLEDİK
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <FastLED.h>
+#define BUTTON_PIN 4      // ESP32 üzerindeki BOOT tuşu (İstersen harici pin yazabilirsin)
+int dashMode = 0;         // 0: Senin Klasik Mavi Kutulu Tasarım, 1: Yeni Race Tasarımı
+
+/* ================= EKRAN AYARLARI ================= */
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite sprite = TFT_eSprite(&tft);
+
+/* ================= WIFI & OBD (V-LINK) ================= */
+const char* ssid = "V-LINK";
+const char* password = "";
+IPAddress elmIP(192, 168, 0, 10);
+uint16_t elmPort = 35000;
+
+/* ================= SHIFT LIGHT & EEPROM ================= */
+#define EEPROM_ADDR_MODE       0   
+#define EEPROM_ADDR_BRIGHTNESS 1   
+#define EEPROM_ADDR_STROBE     2   
+#define EEPROM_ADDR_FAKE       3   
+#define EEPROM_ADDR_RPMSTART   4   
+#define EEPROM_ADDR_RPMGREEN   8   
+#define EEPROM_ADDR_RPMYELLOW  12  
+#define EEPROM_ADDR_RMPRED     16  
+
+#define LED_PIN     5
+#define NUM_LEDS    8
+#define LED_TYPE    WS2812
+#define COLOR_ORDER GRB
+#define EEPROM_SIZE 32
+
+CRGB leds[NUM_LEDS];
+const int centerLeft  = 3;
+const int centerRight = 4;
+
+#define MODE_GUNLUK   0
+#define MODE_CADDE    1
+#define MODE_SPORT    2
+#define MODE_REVERSE  3
+#define MODE_LINEAR   4  
+#define MODE_AERO     5  
+#define MODE_KNIGHT   6  
+#define MODE_DEMO     7  
+#define MODE_HEART    8  
+#define MODE_GLITCH   9  
+#define MODE_RAIN     10
+
+int currentMode = MODE_GUNLUK;
+int rpmStart, rpmGreenEnd, rpmYellowEnd, rpmRedEnd;
+int ledBrightness = 220;
+int strobeDelay   = 50;
+bool allowFakeRPM = false; 
+
+int fakeRPM = 800;
+int fakeDir = 1;
+unsigned long lastFakeTime = 0;
+
+unsigned long lastStrobeTime = 0;
+bool strobeState = false;
+unsigned long lastChaseTime = 0;
+int chaseIndex = 0;
+int knightPos = 0;
+int knightDir = 1;
+uint8_t hue = 0;
+
+/* ================= BUTTON  ================= */
+unsigned long buttonPressStart = 0;
+bool buttonHolding = false;
+
+unsigned long lastButtonCheck = 0;
+unsigned long lastClickTime = 0;
+
+int clickCount = 0;
+bool waitForDouble = false;
+/* ================= WEB SERVER ================= */
+WebServer server(80);
+bool apModeStarted = false; // 20 Saniye kuralı için bayrak
+
+/* ================= DATA YAPISI ================= */
+typedef struct {
+  float rpm;
+  float speed;
+  uint8_t gear;
+  float boost;
+
+  float maxRpm;
+  float maxSpeed;
+  float maxBoost;
+
+  // 🔥 TELEMETRİ VERİLERİ (10 ADET) 🔥
+  // Hızlı Güncellenenler
+  int engineLoad;     
+  int throttlePos;    
+  float maf;          
+  float voltage;      
+  
+  // Yavaş Güncellenenler
+  int coolantTemp;    
+  int intakeTemp;     
+  int ambientTemp;    
+  int fuelLevel;      
+  int dpfLoad;
+  int runTime;        
+
+  bool wifiConnected;
+  bool obdConnected;
+} CarData;
+
+CarData car;
+SemaphoreHandle_t dataMutex;
+
+volatile float displayRpm = 0;
+
+uint8_t calcGear(float rpm, float speed){
+
+  if (speed < 5) return 0;
+  if (rpm < 1100) return 0;
+
+  float ratio = rpm / speed;
+  uint8_t currentGear = 0;
+
+  // EGEA 1.3 DİZEL ORANLARI
+  if      (ratio > 95) currentGear = 1;
+  else if (ratio > 53) currentGear = 2;
+  else if (ratio > 35) currentGear = 3;
+  else if (ratio > 25) currentGear = 4;
+  else                 currentGear = 5;
+
+  static uint8_t lastCalculatedGear = 0;
+  static uint8_t stableGear = 0;
+  static int confirmCount = 0;
+
+  if (currentGear == 0) {
+      stableGear = 0;
+      confirmCount = 0;
+  }
+  else if (currentGear > stableGear) {
+
+      if (currentGear == lastCalculatedGear) {
+          confirmCount++;
+          if (confirmCount >= 1) {
+              stableGear = currentGear;
+              confirmCount = 0;
+          }
+      } else {
+          confirmCount = 0;
+      }
+  }
+  else {
+      stableGear = currentGear;
+      confirmCount = 0;
+  }
+
+  lastCalculatedGear = currentGear;
+  return stableGear;
+}
+
+/* ================= OBD REQUEST ================= */
+int getOBDData(WiFiClient &client, String cmd, String expectedPrefix, int byteCount) {
+  while(client.available()) client.read(); 
+  client.print(cmd + "\r");
+  String resp = "";
+  long timeout = millis() + 400; 
+ while(millis() < timeout) {
+  if(client.available()) {
+    char c = client.read();
+    if(c == '>') break;
+    resp += c;
+  } else {
+    vTaskDelay(1);   // SADECE veri yokken uyur
+  }
+}
+  resp.replace(" ", ""); resp.replace("\r", ""); resp.replace("\n", "");
+  int idx = resp.indexOf(expectedPrefix);
+  if (idx >= 0 && resp.length() >= idx + expectedPrefix.length() + (byteCount * 2)) {
+    String hexData = resp.substring(idx + expectedPrefix.length(), idx + expectedPrefix.length() + (byteCount * 2));
+    return strtol(hexData.c_str(), NULL, 16);
+  }
+  return -1; 
+}
+
+/* ================= TASARIM ECUBAR ================= */
+void drawFramedValue(int x, int y,
+                     String label,
+                     String value) {
+
+  int w = 100;
+
+  // Üst bracket
+  sprite.drawFastVLine(x, y + 20, 8, TFT_WHITE);
+  sprite.drawFastVLine(x + w, y + 20, 8, TFT_WHITE);
+  sprite.drawFastHLine(x, y + 28, 20, TFT_WHITE);
+  sprite.drawFastHLine(x + w - 20, y + 28, 20, TFT_WHITE);
+
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawCentreString(value, x + w/2, y, 4);
+
+  sprite.setTextColor(0x9492);
+  sprite.drawCentreString(label, x + w/2, y + 32, 2);
+}
+
+/* ================= HTML SAYFASI ================= */
+String page() {
+  bool isConnected = false;
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  isConnected = car.obdConnected;
+  xSemaphoreGive(dataMutex);
+
+  String s = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  s += "<style>";
+  s += "body{margin:0;background:#0b0f14;color:#fff;font-family:Arial, sans-serif}";
+  s += ".card{background:#151a21;margin:12px;padding:16px;border-radius:14px;box-shadow: 0 4px 6px rgba(0,0,0,0.3)}";
+  s += "button{width:100%;padding:14px;margin:6px 0;font-size:15px;border:none;border-radius:12px;background:#1f6feb;color:white;cursor:pointer}";
+  s += ".btn-anim{background:#6e40c9} .btn-demo{background:#d03592}";
+  s += "input[type=text], input[type=number] {width:100%;padding:12px;margin:6px 0;border-radius:10px;border:none;background:#21262d;color:#fff; box-sizing:border-box;}";
+  s += "input[type=range] {width:100%; margin: 10px 0;}";
+  s += ".lbl {display:flex; justify-content:space-between; font-size:13px; color:#8b949e; margin-top:5px;}";
+  s += ".chk-group {display:flex; align-items:center; background:#21262d; padding:10px; border-radius:10px; margin-top:10px;}";
+  s += "input[type=checkbox] {width:20px; height:20px; margin-right:10px;}";
+  s += "h2,h3{text-align:center;margin-bottom:10px}";
+  s += ".sub-header{text-align:center;color:#8b949e;font-size:14px;margin-bottom:15px;font-style:italic}";
+  s += ".status{text-align:center;font-weight:bold;padding:10px;border-radius:8px;background:#21262d;color:" + String(isConnected ? "#3fb950" : "#f85149") + "}";
+  s += ".footer{text-align:center;padding:30px 20px;font-size:13px;color:#8b949e;line-height:1.6}";
+  s += "</style></head><body>";
+
+  s += "<div class='card'><h2>SHIFT LIGHT</h2><div class='sub-header'>Egea Pro Version</div>";
+  s += "<div class='status'>" + String(isConnected ? "OBD BAGLI" : "OBD YOK") + "</div></div>";
+
+  s += "<div class='card'><h3>SURUS MODLARI</h3><form action='/mode'>";
+  s += "<button name='m' value='0'>GUNLUK (MERKEZ)</button>";
+  s += "<button name='m' value='4'>LINEAR (SOLDAN SAGA)</button>"; 
+  s += "<button name='m' value='1'>CADDE</button>";
+  s += "<button name='m' value='2'>F1 MODE </button>";
+  s += "<button name='m' value='3'>BLUE SHARK</button>";
+  s += "</form></div>";
+
+  s += "<div class='card'><h3>ANIMASYONLAR</h3><form action='/mode'>";
+  s += "<button name='m' value='5' class='btn-anim'>AERO STROBE (UCAK)</button>";
+  s += "<button name='m' value='6' class='btn-anim'>KARA SIMSEK (KITT)</button>";
+  s += "<button name='m' value='7' class='btn-demo'>DEMO (RAINBOW)</button>";
+  s += "<button name='m' value='8' class='btn-anim'>KALP ATISI</button>";
+  s += "<button name='m' value='9' class='btn-anim'>CYBERPUNK GLITCH</button>";
+  s += "<button name='m' value='10' class='btn-anim'>YAGMUR DAMLASI</button>";
+  s += "</form></div>";
+
+  s += "<div class='card'><h3>RPM & EFEKT AYARLARI</h3><form action='/set'>";
+  s += "<input name='s' type='number' placeholder='RPM BASLANGIC' value='" + String(rpmStart) + "'>";
+  s += "<input name='g' type='number' placeholder='YESIL SON' value='" + String(rpmGreenEnd) + "'>";
+  s += "<input name='y' type='number' placeholder='SARI SON' value='" + String(rpmYellowEnd) + "'>";
+  s += "<input name='r' type='number' placeholder='KIRMIZI SON' value='" + String(rpmRedEnd) + "'>";
+  
+  s += "<hr style='border-color:#30363d; margin:15px 0'>";
+  s += "<div class='lbl'><span>Parlaklik</span><span id='b_val'>" + String(ledBrightness) + "</span></div>";
+  s += "<input type='range' name='b' min='5' max='255' value='" + String(ledBrightness) + "' oninput='document.getElementById(\"b_val\").innerText=this.value'>";
+
+  s += "<div class='lbl'><span>Strobe Hizi (ms)</span><span id='d_val'>" + String(strobeDelay) + "</span></div>";
+  s += "<input type='range' name='d' min='1' max='300' value='" + String(strobeDelay) + "' oninput='document.getElementById(\"d_val\").innerText=this.value'>";
+
+  String checked = allowFakeRPM ? "checked" : "";
+  s += "<div class='chk-group'>";
+  s += "<input type='checkbox' name='f' " + checked + ">";
+  s += "<label>TEST MODE (ONLY DEV)</label>";
+  s += "</div>";
+
+  s += "<button style='margin-top:15px'>Kaydet</button></form></div>";
+  s += "<div class='footer'><b>CAGAN DERİNDERE</b></div>";
+  s += "</body></html>";
+  return s;
+}
+
+/* ================= WEB SERVER KURULUMU ================= */
+void setupWebServerRoutes() {
+  server.on("/", [](){ server.send(200,"text/html",page()); });
+  server.on("/mode", [](){ 
+    currentMode = server.arg("m").toInt(); 
+    EEPROM.write(EEPROM_ADDR_MODE, currentMode);
+    EEPROM.commit();
+    server.send(200,"text/html",page()); 
+  });
+  
+  server.on("/set", [](){ 
+    if(server.arg("s")!="") rpmStart = server.arg("s").toInt();
+    if(server.arg("g")!="") rpmGreenEnd = server.arg("g").toInt();
+    if(server.arg("y")!="") rpmYellowEnd = server.arg("y").toInt();
+    if(server.arg("r")!="") rpmRedEnd = server.arg("r").toInt();
+    
+    if(server.hasArg("b")) { 
+      ledBrightness = server.arg("b").toInt(); 
+      FastLED.setBrightness(ledBrightness);
+      EEPROM.write(EEPROM_ADDR_BRIGHTNESS, ledBrightness);
+    }
+    allowFakeRPM = server.hasArg("f"); 
+    EEPROM.write(EEPROM_ADDR_FAKE, allowFakeRPM ? 1 : 0);
+
+    EEPROM.put(EEPROM_ADDR_RPMSTART, rpmStart);
+    EEPROM.put(EEPROM_ADDR_RPMGREEN, rpmGreenEnd);
+    EEPROM.put(EEPROM_ADDR_RPMYELLOW, rpmYellowEnd);
+    EEPROM.put(EEPROM_ADDR_RMPRED, rpmRedEnd);
+    EEPROM.commit(); 
+    server.send(200,"text/html",page());
+  });
+}
+
+/* ================= LED EFEKT FONKSIYONLARI ================= */
+void drawCenter(int p, CRGB c) {
+  for (int i = 0; i < p; i++) {
+    if (centerLeft - i >= 0) leds[centerLeft - i] = c;
+    if (centerRight + i < NUM_LEDS) leds[centerRight + i] = c;
+  }
+}
+
+void shiftStrobe() {
+  if (millis() - lastStrobeTime >= strobeDelay) {
+    lastStrobeTime = millis();
+    strobeState = !strobeState;
+    fill_solid(leds, NUM_LEDS, strobeState ? CRGB::Red : CRGB::White);
+  } else {
+     fill_solid(leds, NUM_LEDS, strobeState ? CRGB::Red : CRGB::White);
+  }
+}
+
+void reverseShiftStrobe() {
+  if (millis() - lastStrobeTime >= strobeDelay) {
+    lastStrobeTime = millis();
+    strobeState = !strobeState;
+    fill_solid(leds, NUM_LEDS, CRGB::Blue); 
+    if (strobeState) { leds[3] = CRGB::White; leds[4] = CRGB::White; }
+  } else {
+     fill_solid(leds, NUM_LEDS, CRGB::Blue); 
+     if (strobeState) { leds[3] = CRGB::White; leds[4] = CRGB::White; }
+  }
+}
+
+void aeroStrobe() {
+  unsigned long m = millis() % 2000; 
+  fill_solid(leds, NUM_LEDS, CRGB::Red);
+  if ((m >= 0 && m < 40) || (m >= 140 && m < 180) || (m >= 280 && m < 320) || (m >= 420 && m < 460) || (m >= 660 && m < 910)) 
+  { fill_solid(leds, NUM_LEDS, CRGB::White); }
+}
+
+void heartbeatEffect() {
+  float bpm = 60.0; unsigned long ms = millis();
+  float beat = pow(sin(PI * bpm * ms / 60000.0), 10); 
+  float beat2 = pow(sin(PI * bpm * ms / 60000.0 + 0.3), 10);
+  uint8_t brightness = constrain((beat + beat2) * 255, 0, 255);
+  fadeToBlackBy(leds, NUM_LEDS, 20); 
+  for(int i=0; i<NUM_LEDS/2; i++) {
+    leds[centerLeft-i] = CRGB::Red; leds[centerRight+i] = CRGB::Red;
+    leds[centerLeft-i].nscale8(brightness); leds[centerRight+i].nscale8(brightness);
+  }
+}
+
+void cyberpunkGlitch() {
+  if (random8() > 220) { leds[random8(NUM_LEDS)] = (random8() > 128) ? CRGB::DeepPink : CRGB::Cyan; }
+  fadeToBlackBy(leds, NUM_LEDS, 50); 
+}
+
+void raindropEffect() {
+  fadeToBlackBy(leds, NUM_LEDS, 40);
+  if (random8() > 230) { leds[random8(NUM_LEDS)] = CRGB::Blue; }
+}
+
+void knightRider() {
+  if (millis() - lastChaseTime > 80) {
+    lastChaseTime = millis();
+    fadeToBlackBy(leds, NUM_LEDS, 150); 
+    leds[knightPos] = CRGB::Red;
+    knightPos += knightDir;
+    if (knightPos <= 0 || knightPos >= NUM_LEDS - 1) knightDir *= -1;
+  }
+}
+
+void linearFill(int rpm) {
+  FastLED.clear(); 
+  if (rpm < rpmStart) return; 
+  int numLedsToLight = map(constrain(rpm, rpmStart, rpmRedEnd), rpmStart, rpmRedEnd, 1, NUM_LEDS);
+  for (int i = 0; i < numLedsToLight; i++) {
+    int reversedIndex = (NUM_LEDS - 1) - i; 
+    if (rpm < rpmGreenEnd) leds[reversedIndex] = CRGB::Green;
+    else if (rpm < rpmYellowEnd) leds[reversedIndex] = CRGB::Yellow;
+    else leds[reversedIndex] = CRGB::Red;
+  }
+  if (rpm >= rpmRedEnd) shiftStrobe();
+}
+
+void gunluk(int rpm) {
+  FastLED.clear(); // Her karede temizle
+  
+  // 1. Durum: Devir başlangıcın altındaysa hiçbir şey yakma
+  if (rpm < rpmStart) return;
+
+  // 2. Durum: BAŞLANGIÇ - YEŞİL SON (Hazırlık Bölgesi)
+  // Bu aralıkta sadece en ortadaki 2 LED yeşil yanar, beklemede kalır.
+  if (rpm < rpmGreenEnd) {
+    drawCenter(1, CRGB::Green); 
+  }
+  
+  // 3. Durum: YEŞİL SON - SARI SON (Asıl Dolma Bölgesi)
+  // Devir 2700'ü (GreenEnd) geçtiği an orta 2 LED sarıya döner 
+  // ve 3200'e (YellowEnd) kadar sağa-sola tek tek dolarak 8 LED olur.
+  else if (rpm < rpmYellowEnd) {
+    // p=1 (orta 2) ile p=4 (8 LED) arası yağ gibi dolar
+    int p = map(rpm, rpmGreenEnd, rpmYellowEnd, 1, 4);
+    drawCenter(p, CRGB::Yellow);
+  }
+  
+  // 4. Durum: SARI SON - KIRMIZI SON (Kritik Bölge)
+  // 3200 devri geçtiğin an her yer aniden KIRMIZI olur.
+  else if (rpm < rpmRedEnd) {
+    fill_solid(leds, NUM_LEDS, CRGB::Red);
+  }
+  
+  // 5. Durum: KIRMIZI SON VE ÜSTÜ (Yarış/Vites Bölgesi)
+  // 3500 devri geçtiğin an çakarlar patlar.
+  else {
+    shiftStrobe();
+  }
+}
+
+int getFakeRPM() {
+  if (millis() - lastFakeTime > 20) { 
+    lastFakeTime = millis();
+    fakeRPM += (fakeDir * 50); 
+    if (fakeRPM >= rpmRedEnd + 200) { fakeRPM = rpmRedEnd + 200; fakeDir = -1; }
+    if (fakeRPM <= 800) { fakeRPM = 800; fakeDir = 1; }
+  }
+  return fakeRPM;
+}
+/* ================= EKRAN 0: MINIMALIST RED & WHITE (BARSIZ) ================= */
+void drawDashboardMinimal(CarData d) {
+  sprite.fillSprite(TFT_BLACK);
+
+  // --- FLASH (ÇAKAR) ZAMANLAMASI ---
+  bool flashOn = (millis() / 100) % 2; 
+
+  // 🔥 1. ÜST: RPM (TAM MERKEZ 160 - BEYAZ) 🔥
+  sprite.setTextDatum(CC_DATUM);
+  sprite.setTextColor(TFT_WHITE); // RPM Artık Beyaz
+  sprite.setTextFont(4);
+  sprite.drawString(String((int)d.rpm) + " RPM", 160, 20); 
+
+  // 🔥 2. TAM BOY YATAY ÇİZGİ 🔥
+  // Shift devri geldiyse yanıp söner, gelmediyse sabit kırmızı
+  uint16_t currentLineCol = TFT_RED;
+  if (d.rpm >= rpmRedEnd && !flashOn) currentLineCol = TFT_BLACK;
+  
+  // Ekranı baştan başa bölen ince çizgi
+  sprite.drawFastHLine(0, 32, 320, currentLineCol); 
+
+  // 3. DİKEY AYIRICI (100+ Hız için 120'ye çektik, daha ferah)
+  sprite.drawFastVLine(120, 45, 140, 0x18E3);
+
+  // 4. SOL: VİTES (GEAR)
+  int gearX = 60; // Sol tarafın merkezi
+  sprite.setTextColor(0x8B94); sprite.setTextFont(2);
+  sprite.drawString("GEAR", gearX, 75);
+
+  // Vites Çakarı (Kırmızı)
+  uint16_t currentGearCol = TFT_GREEN;
+
+if (d.rpm >= rpmRedEnd) {
+    if(!flashOn) currentGearCol = TFT_BLACK;   // vites görünmez → flash
+}
+
+  sprite.setTextColor(currentGearCol); 
+  if(d.gear == 0) {
+     sprite.setTextFont(4); sprite.setTextSize(3);
+     sprite.drawString("N", gearX, 125);
+     sprite.setTextSize(1);
+  } else {
+     sprite.setTextFont(8);
+     sprite.drawString(String(d.gear), gearX, 130);
+  }
+
+  // 5. SAĞ: HIZ (SPEED - YANDAKİ BOŞLUĞU KULLANAN YENİ YERLEŞİM)
+  int speedX = 220; // Sağ tarafın merkezi
+  sprite.setTextColor(0x8B94); sprite.setTextFont(2);
+  sprite.drawString("SPEED", speedX, 75);
+
+  sprite.setTextColor(TFT_WHITE); // Hız beyaz
+  sprite.setTextFont(8);
+  sprite.drawString(String((int)d.speed), speedX, 130);
+  
+  sprite.setTextColor(0x8B94); sprite.setTextFont(4);
+  sprite.drawString("km/h", speedX, 185);
+
+  // 6. ALT: LOGO & STATUS
+  sprite.setTextColor(TFT_RED); sprite.setTextFont(2);
+  sprite.drawString("EGEA PERFORMANCE", 160, 225);
+
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(d.wifiConnected ? TFT_GREEN : TFT_RED);
+  sprite.drawString("WIFI", 10, 220, 2);
+  
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextColor(d.obdConnected ? TFT_GREEN : TFT_RED);
+  sprite.drawString("OBD", 310, 220, 2);
+
+  sprite.pushSprite(0, 0);
+}
+/* ================= EKRAN 3: TELEMETRİ (Okunaklı & Siyah Tema) ================= */
+void drawDashboardTelemetry(CarData d) {
+  sprite.fillSprite(TFT_BLACK); // Simsiyah arka plan (Kontrast tavan)
+
+  // ================= BAŞLIK =================
+  sprite.setTextDatum(CC_DATUM);
+  sprite.setTextColor(TFT_ORANGE);
+  sprite.setTextFont(4); // Başlığı da büyüttük
+  sprite.drawString("EGEA PERFORMANCE", 160, 16);
+  sprite.drawFastHLine(10, 34, 300, 0x3186); // Çizgiyi uzattık
+  sprite.setTextDatum(TL_DATUM); 
+
+  int startY = 45;
+  int gapY = 38; // Font 4 sığsın diye satır aralıklarını açtık
+
+  uint16_t c_lbl = 0x8B94;    // Etiket rengi (Gri - Göz yormaz)
+  uint16_t c_val = TFT_WHITE; // Değer rengi (Beyaz - Net okunur)
+
+  // ================= SOL SÜTUN =================
+  int leftX = 5;
+  int leftValX = 75; // Değerlerin başlayacağı X koordinatı
+
+  // 1. Load (Motor Yükü)
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Load:", leftX, startY + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.engineLoad) + "%", leftValX, startY);
+
+  // 2. Throttle (Gaz)
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Pedal:", leftX, startY + gapY + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.throttlePos) + "%", leftValX, startY + gapY);
+
+  // 3. MAF Flow
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("MAF:", leftX, startY + gapY*2 + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String((int)d.maf) + "g", leftValX, startY + gapY*2);
+
+  // 4. Voltaj
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Volt:", leftX, startY + gapY*3 + 6);
+  uint16_t voltCol = (d.voltage < 12.0) ? TFT_RED : TFT_GREEN; 
+  sprite.setTextFont(4); sprite.setTextColor(voltCol); sprite.drawString(String(d.voltage, 1) + "V", leftValX, startY + gapY*3);
+
+  // 5. Run Time
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Time:", leftX, startY + gapY*4 + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.runTime) + "s", leftValX, startY + gapY*4);
+
+  // ================= SAĞ SÜTUN =================
+  int rightX = 160;
+  int rightValX = 230; // Sağ tarafın değerlerinin başlayacağı X koordinatı
+
+  // 1. Coolant (Hararet)
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Su T:", rightX, startY + 6);
+  uint16_t tempCol = (d.coolantTemp > 95) ? TFT_RED : TFT_WHITE;
+  sprite.setTextFont(4); sprite.setTextColor(tempCol); sprite.drawString(String(d.coolantTemp) + "C", rightValX, startY);
+
+  // 2. Intake Temp
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Emme:", rightX, startY + gapY + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.intakeTemp) + "C", rightValX, startY + gapY);
+
+  // 3. Ambient
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Dis:", rightX, startY + gapY*2 + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.ambientTemp) + "C", rightValX, startY + gapY*2);
+
+  // 4. Barometric
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("DPF:", rightX, startY + gapY*3 + 6);
+  sprite.setTextFont(4); sprite.setTextColor(c_val); sprite.drawString(String(d.dpfLoad) + "%", rightValX, startY + gapY*3);
+
+  // 5. Fuel Level (YAKIT BARI)
+  sprite.setTextFont(2); sprite.setTextColor(c_lbl); sprite.drawString("Fuel:", rightX, startY + gapY*4 + 6);
+  uint16_t fCol = (d.fuelLevel <= 15) ? TFT_RED : ((d.fuelLevel <= 30) ? TFT_YELLOW : TFT_GREEN);
+  int fillW = map(constrain(d.fuelLevel, 0, 100), 0, 100, 0, 38);
+  
+  // Barı kalınlaştırdık ki büyük fontların yanında cılız durmasın
+  sprite.drawRect(rightValX, startY + gapY*4 + 8, 40, 14, TFT_WHITE); 
+  sprite.fillRect(rightValX + 1, startY + gapY*4 + 9, fillW, 12, fCol);
+  
+  // Yüzdeyi barın hemen sağına yazdır
+  sprite.setTextFont(2); sprite.setTextColor(fCol); sprite.drawString(String(d.fuelLevel) + "%", rightValX + 44, startY + gapY*4 + 6);
+
+  // ===========================================
+  sprite.pushSprite(0, 0);
+}
+
+ 
+ /* ================= EKRAN 1: KLASİK TASARIM (Senin Yaptığın) ================= */
+void drawDashboardClassic(CarData d) {
+
+  sprite.fillSprite(TFT_BLACK);
+
+  
+  
+     // =====================================================
+// ================= SESSION MAX PRO ===================
+// =====================================================
+
+int mx = 5;              
+int mw = 94;             // ENİ KORUDUK
+int my = 82;             // Bir tık yukarı aldık
+int rowH = 40;           // Daha geniş dikey alan
+
+uint16_t raceOrange = 0xFD20;
+
+// Wifi 220 → 210 güvenli bitiş
+int totalH = 138;
+
+sprite.drawRoundRect(mx, my, mw, totalH, 12, raceOrange);
+
+// Başlık
+sprite.setTextColor(raceOrange);
+sprite.drawCentreString("SESSION MAX", mx + mw/2, my + 6, 1);
+
+sprite.drawFastHLine(mx + 12, my + 16, mw - 24, raceOrange);
+
+// ================= RPM =================
+int r1 = my + 24;
+
+sprite.drawCentreString("RPM", mx + mw/2, r1, 1);
+
+// Büyük değer
+sprite.setTextFont(4);
+sprite.setTextSize(1);
+sprite.drawCentreString(String((int)d.maxRpm),
+                        mx + mw/2,
+                        r1 + 12,
+                        4);
+
+// ================= SPEED =================
+int r2 = r1 + rowH;
+
+sprite.drawFastHLine(mx + 14, r2 - 8, mw - 28, raceOrange);
+
+sprite.setTextFont(1);
+sprite.drawCentreString("SPD", mx + mw/2, r2, 1);
+
+sprite.setTextFont(4);
+sprite.drawCentreString(String((int)d.maxSpeed),
+                        mx + mw/2,
+                        r2 + 12,
+                        4);
+
+// ================= TURBO =================
+int r3 = r2 + rowH;
+
+sprite.drawFastHLine(mx + 14, r3 - 8, mw - 28, raceOrange);
+
+sprite.setTextFont(1);
+sprite.drawCentreString("BOOST", mx + mw/2, r3, 1);
+
+sprite.setTextFont(4);
+sprite.drawCentreString(String(d.maxBoost, 1),
+                        mx + mw/2,
+                        r3 + 6,
+                        4);
+
+// Font reset
+sprite.setTextFont(1);
+
+  // =====================================================
+// ===================== ORTA TEMİZ =====================
+// =====================================================
+
+int midX = 160;
+uint16_t c_label = 0x9492;
+
+// (İstersen üstte küçük bir başlık bırakabilirsin)
+//sprite.setTextColor(c_label);
+ //sprite.drawCentreString("RACE HUB", midX, 5, 2);
+
+ 
+
+// =====================================================
+// ===================== EN ALT ORTA - GEAR ============
+// ===================== GEAR (YUKARI DOĞRU BÜYÜTÜLDÜ) =====================
+
+int gearBoxWidth  = 100;   
+int gearBoxHeight = 110;
+int bottomY = 235;
+int gearY = bottomY - gearBoxHeight;
+
+// =====================================================
+// ================= DİNAMİK DURUM YAZISI ==============
+// =====================================================
+
+uint16_t raceColor = TFT_RED;
+int labelY = gearY - 25;
+
+if (d.rpm >= rpmRedEnd) {
+
+    sprite.setTextColor(TFT_RED);
+    sprite.drawCentreString("!!! SHIFT !!!", midX, labelY, 2);
+
+    if ((millis() / 150) % 2 == 0) {
+        sprite.drawFastHLine(midX - 50, gearY - 8, 100, TFT_RED);
+    }
+
+} 
+else {
+
+    sprite.setTextColor(raceColor);
+
+    if (d.boost > 0.7) {
+        sprite.drawCentreString("BOOSTING", midX, labelY, 2);
+    } 
+    else {
+        sprite.drawCentreString("#RACEONE", midX, labelY, 2);
+    }
+
+    sprite.drawFastHLine(midX - 40, gearY - 8, 80, 0x3186);
+}
+
+// 1. Çerçeveyi tekrar sabit BEYAZ yaptık (Senin sevdiğin klasik stil)
+sprite.drawRoundRect(midX - gearBoxWidth/2, gearY, gearBoxWidth, gearBoxHeight, 16, TFT_WHITE);
+
+sprite.setTextDatum(CC_DATUM);
+
+int centerX = midX;
+int centerY = gearY + (gearBoxHeight / 2);
+
+// Karakterlere özel X ve Y eksenli manuel ofsetler
+int yOffset = 0;
+int xOffset = 0; 
+
+// EĞER BOŞTAYSA (N) VEYA OBD YOKSA
+if (!d.obdConnected || d.gear == 0) {
+    yOffset = 10;  // N harfini yukarı/aşağı kaydırmak için (Gerekirse bu sayıyla oyna)
+    xOffset = 0;  // N harfini sağa/sola kaydırmak için (Gerekirse bu sayıyla oyna)
+
+    sprite.setTextColor(TFT_RED);
+    sprite.setTextFont(4); 
+    sprite.setTextSize(4); 
+    sprite.drawString("N", centerX + xOffset, centerY + yOffset);
+} 
+// EĞER VİTESTEYSE (1, 2, 3, 4, 5)
+else {
+    yOffset = 3;   // Rakamlar için eski ayarın gayet iyiydi
+    xOffset = 0;
+
+    sprite.setTextColor(TFT_WHITE);
+    sprite.setTextFont(8);
+    sprite.setTextSize(1);
+    sprite.drawString(String(d.gear), centerX + xOffset, centerY + yOffset);
+}
+
+sprite.setTextSize(1);
+sprite.setTextFont(1);
+sprite.setTextDatum(TL_DATUM);
+
+ // =====================================================
+// ===================== TURBO (GENİŞLETİLMİŞ) =========
+// =====================================================
+
+int tx = 5;          // En sola yasladık
+int ty = 20; 
+int tw = 150;        // Genişlik 100 -> 150 yapıldı
+int th = 30; 
+
+// Üst Çizgi ve Çentikler (0, 1, 2 bar için)
+sprite.drawFastHLine(tx + 5, ty, tw - 10, TFT_WHITE);
+sprite.drawFastVLine(tx + 5, ty, 5, TFT_WHITE);              // 0 noktası
+sprite.drawFastVLine(tx + (tw/2), ty, 5, TFT_WHITE);         // 1 noktası
+sprite.drawFastVLine(tx + tw - 5, ty, 5, TFT_WHITE);         // 2 noktası
+
+sprite.setTextColor(TFT_WHITE);
+sprite.drawString("0", tx + 3, ty - 12, 1);
+sprite.drawString("1", tx + (tw/2) - 2, ty - 12, 1);
+sprite.drawString("2", tx + tw - 8, ty - 12, 1);
+
+// Bar Arkaplanı
+sprite.fillRect(tx + 5, ty + 7, tw - 10, th, 0x3186);
+
+float bVal = constrain(d.boost, 0.0, 2.0);
+int turboFillW = map(bVal * 100, 0, 200, 0, tw - 10);
+uint16_t tCol = (bVal > 1.3) ? TFT_RED : TFT_YELLOW;
+sprite.fillRect(tx + 5, ty + 7, turboFillW, th, tCol);
+
+sprite.setTextColor(TFT_WHITE);
+sprite.drawCentreString(String(d.boost, 1) + " bar", tx + (tw/2), ty + 15, 2);
+
+// ALT ÇERÇEVE SÜSÜ (TURBO YAZISI İÇİN)
+sprite.drawFastVLine(tx + 5, ty + 38, 8, TFT_WHITE);
+sprite.drawFastVLine(tx + tw - 5, ty + 38, 8, TFT_WHITE);
+sprite.drawFastHLine(tx + 5, ty + 46, 25, TFT_WHITE);        // Çizgiyi uzattık
+sprite.drawFastHLine(tx + tw - 30, ty + 46, 25, TFT_WHITE);
+
+sprite.drawCentreString("TURBO", tx + (tw/2), ty + 40, 2);
+sprite.setTextColor(c_label);
+
+
+// =====================================================
+// ===================== RPM BAR (GENİŞLETİLMİŞ) =======
+// =====================================================
+
+int rx = 165;        
+int ry = 20;          
+int rw = 150;        
+int rh = 30; 
+
+int rpmMaxScale = 4000;
+
+// ===================== ÜST ÖLÇEK =====================
+sprite.drawFastHLine(rx + 5, ry, rw - 10, TFT_WHITE);
+sprite.drawFastVLine(rx + 5, ry, 5, TFT_WHITE);               
+sprite.drawFastVLine(rx + (rw/2), ry, 5, TFT_WHITE);          
+sprite.drawFastVLine(rx + rw - 5, ry, 5, TFT_WHITE);          
+
+sprite.setTextColor(TFT_WHITE);
+sprite.drawString("0", rx + 3, ry - 12, 1);
+sprite.drawString("2", rx + (rw/2) - 3, ry - 12, 1);
+sprite.drawString("4", rx + rw - 12, ry - 12, 1);
+
+// ===================== BAR =====================
+sprite.fillRect(rx + 5, ry + 7, rw - 10, rh, 0x3186);
+
+float rVal = constrain(d.rpm, 0, rpmMaxScale);
+int fillW = map(rVal, 0, rpmMaxScale, 0, rw - 10);
+
+uint16_t barColor = 
+  (rVal > 3200) ? TFT_RED :
+  (rVal > 2600) ? TFT_YELLOW :
+                  TFT_GREEN;
+
+sprite.fillRect(rx + 5, ry + 7, fillW, rh, barColor);
+
+// RPM değeri bar ortasında
+sprite.setTextColor(TFT_WHITE);
+sprite.drawCentreString(String((int)d.rpm),
+                        rx + rw/2,
+                        ry + 15,
+                        2);
+
+// ===================== ALT BRACKET (TURBO İLE AYNI STİL) =====================
+
+int bracketTop    = ry + 38;   // turbo ile aynı oran
+int bracketBottom = ry + 46;
+
+// Dikey çizgiler
+sprite.drawFastVLine(rx + 5, bracketTop, 8, TFT_WHITE);
+sprite.drawFastVLine(rx + rw - 5, bracketTop, 8, TFT_WHITE);
+
+// Yatay çizgiler
+sprite.drawFastHLine(rx + 5, bracketBottom, 25, TFT_WHITE);
+sprite.drawFastHLine(rx + rw - 30, bracketBottom, 25, TFT_WHITE);
+
+// Yazı ortada (turbo ile aynı yükseklik oranı)
+sprite.setTextColor(TFT_WHITE);
+sprite.drawCentreString("RPM",
+                        rx + (rw/2),
+                        ry + 40,
+                        2);
+
+// =====================================================
+// ===================== SPEED BAR (ORTA) =================
+// =====================================================
+
+int sx = 210;
+int sy = 100;   
+int sw = 100;
+int sh = 18;
+
+// ===================== ÜST ÖLÇEK =====================
+sprite.drawFastHLine(sx + 5, sy, sw - 10, TFT_WHITE);
+sprite.drawFastVLine(sx + 5, sy, 5, TFT_WHITE);
+sprite.drawFastVLine(sx + sw - 5, sy, 5, TFT_WHITE);
+
+sprite.setTextColor(TFT_WHITE);
+sprite.drawString("0", sx + 3, sy - 12, 1);
+sprite.drawString("220", sx + sw - 25, sy - 12, 1);
+
+// ===================== BAR =====================
+sprite.fillRect(sx + 5, sy + 7, sw - 10, sh, 0x3186);
+
+float sVal = constrain(d.speed, 0, 220);
+int speedFillW = map(sVal, 0, 220, 0, sw - 10);
+
+sprite.fillRect(sx + 5, sy + 7, speedFillW, sh, TFT_CYAN);
+
+// Hız değeri bar ortasında
+sprite.setTextColor(TFT_WHITE);
+sprite.drawCentreString(String((int)d.speed),
+                        sx + sw/2,
+                        sy + 9,
+                        2);
+
+// ===================== ALT BRACKET (TURBO/RPM GİBİ) =====================
+int sBracketTop    = sy + 38;
+int sBracketBottom = sy + 46;
+
+sprite.drawFastVLine(sx + 5, sBracketTop, 8, TFT_WHITE);
+sprite.drawFastVLine(sx + sw - 5, sBracketTop, 8, TFT_WHITE);
+
+sprite.drawFastHLine(sx + 5, sBracketBottom, 20, TFT_WHITE);
+sprite.drawFastHLine(sx + sw - 25, sBracketBottom, 20, TFT_WHITE);
+
+sprite.drawCentreString("SPEED",
+                        sx + sw/2,
+                        sy + 40,
+                        2);
+
+// =====================================================
+// ===================== INTAKE (EN ALT - BAR YOK) =================
+// =====================================================
+
+int ix = 210;
+int iy = 165;
+
+String intakeText;
+
+if(!d.obdConnected) {
+  intakeText = "WAIT";
+}
+else {
+  intakeText = "STABLE";
+}
+
+drawFramedValue(ix, iy, "INTAKE", intakeText);
+
+  // ===================== ALT STATUS =====================
+
+  sprite.setTextColor(d.wifiConnected ? TFT_GREEN : TFT_RED);
+  sprite.drawString("WIFI", 5, 220, 2);
+
+  sprite.setTextColor(d.obdConnected ? TFT_GREEN : TFT_RED);
+  sprite.drawRightString("OBD", 315, 220, 2);
+
+  sprite.pushSprite(0, 0);
+}
+/* ================= EKRAN 2: YENİ EFSANE TASARIM (Race Dash) ================= */
+void drawDashboardRace(CarData d) {
+  sprite.fillSprite(TFT_BLACK);
+
+  uint16_t c_label = 0xFEA0;     
+  uint16_t c_value = TFT_ORANGE; 
+  uint16_t c_rpmBarBg = 0x18E3;  
+  
+  // ================= SEGMENTLİ ÜST RPM BAR (0-7000) =================
+
+int maxRpmScale = 7000;
+int totalSegments = 40;     // Kaç çizgi olsun
+int segmentWidth = 6;
+int segmentGap   = 2;
+
+int totalWidth = totalSegments * (segmentWidth + segmentGap);
+int startX = (320 - totalWidth) / 2;
+
+// Arkaplan temizle
+sprite.fillRect(0, 0, 320, 15, 0x18E3);
+
+float rpmVal = constrain(d.rpm, 0, maxRpmScale);
+
+for (int i = 0; i < totalSegments; i++) {
+
+    int blockRpm = (i + 1) * (maxRpmScale / totalSegments);
+    int xPos = startX + i * (segmentWidth + segmentGap);
+
+    uint16_t color = 0x3186; // Pasif segment
+
+    if (rpmVal >= blockRpm) {
+
+        if (blockRpm >= 3200)
+            color = TFT_RED;
+        else if (blockRpm >= 2400)
+            color = TFT_YELLOW;
+        else
+            color = TFT_GREEN;
+    }
+
+    sprite.fillRect(xPos, 0, segmentWidth, 14, color);
+}
+
+  // Sol Sütun
+  int leftX = 5; int startY = 25; int ySpacing = 70; 
+   // Intake Sabit OK (Garantili Görünür)
+sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+sprite.setTextFont(4);          // Font 6 yerine 4
+sprite.setTextSize(1);
+sprite.drawString("INTAKE", leftX, startY, 2);
+sprite.drawString("OK", leftX, startY + 22, 4);
+sprite.setTextFont(1);
+  sprite.setTextColor(c_label); sprite.drawString("Boost PRS", leftX, startY + ySpacing, 2);
+  sprite.setTextColor(c_value); sprite.drawString(String(d.boost, 1), leftX, startY + ySpacing + 15, 6);
+  sprite.setTextColor(c_label); sprite.drawString("Max Boost", leftX, startY + ySpacing*2, 2);
+  sprite.setTextColor(c_value); sprite.drawString(String(d.maxBoost, 1), leftX, startY + ySpacing*2 + 15, 6);
+
+  // Sağ Sütun
+  int rightX = 315; 
+  sprite.setTextColor(c_label); sprite.drawRightString("Speed", rightX, startY, 2);
+  sprite.setTextColor(c_value); sprite.drawRightString(String((int)d.speed), rightX, startY + 15, 6);
+  sprite.setTextColor(c_label); sprite.drawRightString("Max SPD", rightX, startY + ySpacing, 2);
+  sprite.setTextColor(c_value); sprite.drawRightString(String((int)d.maxSpeed), rightX, startY + ySpacing + 15, 6);
+  sprite.setTextColor(c_label); sprite.drawRightString("Max RPM", rightX, startY + ySpacing*2, 2);
+  sprite.setTextColor(c_value); sprite.drawRightString(String((int)d.maxRpm), rightX, startY + ySpacing*2 + 15, 6);
+
+  // Merkez
+  int midX = 160;
+  sprite.setTextColor(c_value); sprite.drawRightString(String((int)d.rpm), midX + 35, 35, 7); 
+  sprite.setTextColor(c_label); sprite.drawString("r/min", midX + 40, 60, 2);
+
+  if (d.gear == 0) {
+    sprite.setTextColor(c_value); sprite.setTextSize(4); 
+    sprite.drawCentreString("N", midX, 100, 4); sprite.setTextSize(1); 
+  } else {
+    sprite.setTextColor(c_value); sprite.drawCentreString(String(d.gear), midX, 100, 8); 
+  }
+
+  // Alt Statü
+  int botY = 215; 
+  sprite.setTextColor(d.obdConnected ? TFT_GREEN : TFT_RED);
+  sprite.drawRightString(d.obdConnected ? "OBD: OK" : "OBD: NO", midX - 10, botY, 2);
+  sprite.setTextColor(d.wifiConnected ? TFT_CYAN : TFT_ORANGE);
+  sprite.drawString(d.wifiConnected ? "WIFI: OK" : "WIFI: NO", midX + 10, botY, 2);
+
+  sprite.pushSprite(0, 0);
+}
+
+/* ================= OBD TASK (CORE 0) ================= */
+
+/* ================= OBD TASK (CORE 0) ================= */
+void obdTask(void *pv){
+  WiFi.mode(WIFI_STA); 
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+
+  WiFiClient client;
+  bool isOBDConnected = false;
+  
+  // 🔥 ZOMBİ BAĞLANTIYI AVLAMA SAYACI
+  int errorCount = 0; 
+
+  while(1) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    car.wifiConnected = (WiFi.status() == WL_CONNECTED);
+    xSemaphoreGive(dataMutex);
+
+    if (WiFi.status() != WL_CONNECTED) {
+      isOBDConnected = false;
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    if (!client.connected()) {
+      isOBDConnected = false;
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      car.obdConnected = false;
+      xSemaphoreGive(dataMutex);
+
+      if (client.connect(elmIP, elmPort)) {
+        
+        // 1. ICAR PRO UYANDIRMA
+        client.print("\r");      
+        vTaskDelay(1000 / portTICK_PERIOD_MS); 
+        while (client.available()) client.read(); 
+
+        // 2. WARM START
+        client.print("ATWS\r");      
+        vTaskDelay(1000 / portTICK_PERIOD_MS); 
+        while (client.available()) client.read(); 
+
+        // 3. TEMEL AYARLAR
+        client.print("ATE0\r"); vTaskDelay(200 / portTICK_PERIOD_MS);
+        client.print("ATSP0\r"); vTaskDelay(600 / portTICK_PERIOD_MS);
+        client.print("ATAT1\r"); vTaskDelay(200 / portTICK_PERIOD_MS);
+        client.print("ATH0\r"); vTaskDelay(200 / portTICK_PERIOD_MS);
+        while (client.available()) client.read();
+
+        // 4. ECU HANDSHAKE TEST
+        int ready = -1;
+        for(int i = 0; i < 5; i++) {
+            ready = getOBDData(client, "0100", "4100", 4);
+            if(ready >= 0) break;
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+
+        if(ready < 0) {
+            client.stop();
+            isOBDConnected = false;
+            xSemaphoreTake(dataMutex, portMAX_DELAY); car.obdConnected = false; xSemaphoreGive(dataMutex);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue; 
+        } 
+        
+        // 5. BAŞARILI BAĞLANTI
+        isOBDConnected = true;
+        errorCount = 0;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        car.obdConnected = true;
+        xSemaphoreGive(dataMutex);
+      }
+    }
+
+    if (isOBDConnected && client.connected()) {
+      
+      static int lastDashMode = -1;
+      static bool telInitDone = false;
+      static int telInitStep = 0, telFastStep = 0, telSlowStep = 0, slowPollCounter = 0;
+      static uint8_t pidStep = 0;
+      static uint8_t boostSkip = 0;
+      int value = -1;
+
+      
+
+      // Telemetri ekranına yeni geçildiyse sayacı sıfırla (İlk açılışta hepsini çekmek için)
+      if (dashMode != lastDashMode) {
+          if (dashMode == 3) { telInitDone = false; telInitStep = 0; }
+          lastDashMode = dashMode;
+      }
+
+      // =========================================================
+      // EKRAN 0: MİNİMAL (Sadece RPM ve HIZ - Fişek gibi)
+      // =========================================================
+      if (dashMode == 0) {
+        if (pidStep % 2 == 0) {
+            value = getOBDData(client,"010C","410C",2); 
+            if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.rpm = value/4.0; xSemaphoreGive(dataMutex); }
+        } else {
+            value = getOBDData(client,"010D","410D",1); 
+            if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.speed = value; car.gear = calcGear(car.rpm, car.speed); xSemaphoreGive(dataMutex); }
+        }
+        pidStep++; if(pidStep > 1) pidStep = 0;
+      }
+      
+       // =========================================================
+      // EKRAN 1 & 2: KLASİK VE RACE (Senin Hızlandırılmış Orijinal Sistemin)
+      // =========================================================
+      else if (dashMode == 1 || dashMode == 2) {
+        switch(pidStep){
+          case 0: // 🔥 HER ZAMAN RPM (Öncelik 1)
+            value = getOBDData(client,"010C","410C",2);
+            if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.rpm = value/4.0; if(car.rpm>car.maxRpm) car.maxRpm=car.rpm; xSemaphoreGive(dataMutex); } 
+            break;
+            
+          case 1: // 🔥 HIZ VE VİTES HESAPLAMA
+            value = getOBDData(client,"010D","410D",1);
+            if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.speed = value; car.gear = calcGear(car.rpm, car.speed); if(car.speed>car.maxSpeed) car.maxSpeed=car.speed; xSemaphoreGive(dataMutex); } 
+            break;
+            
+          case 2: // 🔥 TEKRAR RPM (Öncelik 2)
+            value = getOBDData(client,"010C","410C",2);
+            if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.rpm = value/4.0; if(car.rpm>car.maxRpm) car.maxRpm=car.rpm; xSemaphoreGive(dataMutex); } 
+            break;
+            
+          case 3: // 🔥 BOOST SEYRELTME MANTIĞI (2 Döngüde 1 Kere)
+            boostSkip++;
+            if(boostSkip >= 2) {
+              value = getOBDData(client,"010B","410B",1);
+              if(value>=0){ float boost=(value-100.0)*0.01; if(boost<0) boost=0; xSemaphoreTake(dataMutex, portMAX_DELAY); car.boost = boost; if(boost>car.maxBoost) car.maxBoost=boost; xSemaphoreGive(dataMutex); } 
+              boostSkip = 0; 
+            } else {
+              value = getOBDData(client,"010C","410C",2);
+              if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.rpm = value/4.0; if(car.rpm>car.maxRpm) car.maxRpm=car.rpm; xSemaphoreGive(dataMutex); }
+            }
+            break;
+        }
+        pidStep++; if(pidStep > 3) pidStep = 0;
+      }
+      
+      // =========================================================
+      // EKRAN 3: AKILLI TELEMETRİ (10 Veri Çekimi)
+      // =========================================================
+      else if (dashMode == 3) {
+        if (!telInitDone) {
+           // İlk açılışta 10 veriyi hızlıca 1 kere çek
+           switch(telInitStep) {
+             case 0: value = getOBDData(client,"0104","4104",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.engineLoad = value*100/255; xSemaphoreGive(dataMutex); } break;
+             case 1: value = getOBDData(client,"0111","4111",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.throttlePos = value*100/255; xSemaphoreGive(dataMutex); } break;
+             case 2: value = getOBDData(client,"0110","4110",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.maf = value/100.0; xSemaphoreGive(dataMutex); } break;
+             case 3: value = getOBDData(client,"0142","4142",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.voltage = value/1000.0; xSemaphoreGive(dataMutex); } break;
+             case 4: value = getOBDData(client,"0105","4105",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.coolantTemp = value-40; xSemaphoreGive(dataMutex); } break;
+             case 5: value = getOBDData(client,"010F","410F",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.intakeTemp = value-40; xSemaphoreGive(dataMutex); } break;
+             case 6: value = getOBDData(client,"0146","4146",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.ambientTemp = value-40; xSemaphoreGive(dataMutex); } break;
+             case 7: value = getOBDData(client,"012F","412F",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.fuelLevel = value*100/255; xSemaphoreGive(dataMutex); } break;
+             case 8:value = getOBDData(client,"2214A3","6214A3",1);if(value>=0){xSemaphoreTake(dataMutex, portMAX_DELAY);car.dpfLoad = map(value,0,255,0,100);xSemaphoreGive(dataMutex);}break;
+             case 9: value = getOBDData(client,"011F","411F",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.runTime = value; xSemaphoreGive(dataMutex); } break;
+           }
+           telInitStep++;
+           if(telInitStep > 9) telInitDone = true; 
+        } 
+        else {
+           // Normal Çalışma: Hızlı verileri sürekli, yavaş verileri 10 turda 1 çek
+           if (slowPollCounter >= 10) {
+              switch(telSlowStep) {
+                 case 0: value = getOBDData(client,"0105","4105",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.coolantTemp = value-40; xSemaphoreGive(dataMutex); } break;
+                 case 1: value = getOBDData(client,"010F","410F",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.intakeTemp = value-40; xSemaphoreGive(dataMutex); } break;
+                 case 2: value = getOBDData(client,"0146","4146",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.ambientTemp = value-40; xSemaphoreGive(dataMutex); } break;
+                 case 3: value = getOBDData(client,"012F","412F",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.fuelLevel = value*100/255; xSemaphoreGive(dataMutex); } break;
+                case 4:value = getOBDData(client,"2214A3","6214A3",1);if(value>=0){  xSemaphoreTake(dataMutex, portMAX_DELAY);car.dpfLoad = map(value,0,255,0,100);xSemaphoreGive(dataMutex);}break;
+                 case 5: value = getOBDData(client,"011F","411F",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.runTime = value; xSemaphoreGive(dataMutex); } break;
+              }
+              telSlowStep++; if(telSlowStep > 5) telSlowStep = 0; 
+              slowPollCounter = 0; 
+           } 
+           else {
+              switch(telFastStep) {
+                 case 0: value = getOBDData(client,"0104","4104",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.engineLoad = value*100/255; xSemaphoreGive(dataMutex); } break;
+                 case 1: value = getOBDData(client,"0111","4111",1); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.throttlePos = value*100/255; xSemaphoreGive(dataMutex); } break;
+                 case 2: value = getOBDData(client,"0110","4110",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.maf = value/100.0; xSemaphoreGive(dataMutex); } break;
+                 case 3: value = getOBDData(client,"0142","4142",2); if(value>=0){ xSemaphoreTake(dataMutex, portMAX_DELAY); car.voltage = value/1000.0; xSemaphoreGive(dataMutex); } break;
+              }
+              telFastStep++;
+              if(telFastStep > 3) { telFastStep = 0; slowPollCounter++; }
+           }
+        }
+        vTaskDelay(50 / portTICK_PERIOD_MS); // Telemetride ECU'yu biraz daha rahat bırak
+      }
+
+      // 🔥 HATA KONTROLÜ (Zombi Bağlantı Tespiti)
+      if (value >= 0) {
+        errorCount = 0; 
+      } else {
+        errorCount++;  
+      }
+
+      // 🚨 Arka arkaya 30 kez veri alamazsak bağlantıyı kopar
+      if (errorCount > 30) {
+         client.stop(); 
+         isOBDConnected = false;
+         errorCount = 0;
+         
+         xSemaphoreTake(dataMutex, portMAX_DELAY);
+         car.obdConnected = false;
+         car.rpm = 0;   
+         car.speed = 0;
+         xSemaphoreGive(dataMutex);
+         
+         vTaskDelay(1000 / portTICK_PERIOD_MS); 
+         continue; 
+      }
+
+    }
+    
+    vTaskDelay(25 / portTICK_PERIOD_MS); // Daha hızlı sorgu
+  }
+}
+
+/* ================= UI TASK (CORE 1) - TUŞLA GEÇİŞ SİSTEMİ ================= */
+void uiTask(void *pv){
+  while(1){
+    // 1. Tuş Kontrolü (4 Ekrana Göre Ayarlandı)
+     if(millis() - lastButtonCheck > 30){
+
+    lastButtonCheck = millis();
+
+    bool buttonState = digitalRead(BUTTON_PIN) == LOW;
+
+    if(buttonState && !buttonHolding){
+        buttonHolding = true;
+        buttonPressStart = millis();
+    }
+
+    if(!buttonState && buttonHolding){
+
+        unsigned long pressTime = millis() - buttonPressStart;
+
+        // 🔴 UZUN BASMA
+        if(pressTime > 5000){
+
+            if(ledBrightness > 50)
+                ledBrightness = 20;
+            else
+                ledBrightness = 220;
+
+            FastLED.setBrightness(ledBrightness);
+
+            EEPROM.write(EEPROM_ADDR_BRIGHTNESS, ledBrightness);
+            EEPROM.commit();
+        }
+
+        // 🔵 KISA BASMA
+        else{
+            clickCount++;
+            lastClickTime = millis();
+            waitForDouble = true;
+        }
+
+        buttonHolding = false;
+    }
+
+    // DOUBLE CLICK KONTROL
+    if(waitForDouble && millis() - lastClickTime > 300){
+
+        if(clickCount == 1){
+            dashMode++;
+            if(dashMode > 3) dashMode = 0;
+        }
+
+        if(clickCount == 2){
+            currentMode++;
+            if(currentMode > MODE_AERO) currentMode = 0;
+        }
+
+        clickCount = 0;
+        waitForDouble = false;
+    }
+}
+
+    // Veriyi kilitle ve kopyala
+    CarData copy;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    copy = car;
+    copy.rpm = displayRpm;
+    xSemaphoreGive(dataMutex);
+
+    // 2. Hangi Moddaysak O Ekranı Çiz
+    if(dashMode == 0)      drawDashboardMinimal(copy);
+    else if(dashMode == 1) drawDashboardClassic(copy);
+    else if(dashMode == 2) drawDashboardRace(copy);
+    else if(dashMode == 3) drawDashboardTelemetry(copy);
+    
+    vTaskDelay(16 / portTICK_PERIOD_MS); 
+  }
+}
+/* ================= SETUP ================= */
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Ekran Kurulumu
+  tft.init(); tft.setRotation(1); sprite.createSprite(320, 240);
+
+  // EEPROM Kurulumu
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(EEPROM_ADDR_RPMSTART, rpmStart);
+  EEPROM.get(EEPROM_ADDR_RPMGREEN, rpmGreenEnd);
+  EEPROM.get(EEPROM_ADDR_RPMYELLOW, rpmYellowEnd);
+  EEPROM.get(EEPROM_ADDR_RMPRED, rpmRedEnd);
+
+  if(rpmStart <= 0 || rpmStart > 10000) rpmStart = 2200;
+  if(rpmGreenEnd <= 0) rpmGreenEnd = 3000;
+  if(rpmYellowEnd <= 0) rpmYellowEnd = 3300;
+  if(rpmRedEnd <= 0) rpmRedEnd = 4000;
+
+  currentMode = EEPROM.read(EEPROM_ADDR_MODE);
+  ledBrightness = EEPROM.read(EEPROM_ADDR_BRIGHTNESS);
+  if(ledBrightness < 5) ledBrightness = 220; 
+  allowFakeRPM = (EEPROM.read(EEPROM_ADDR_FAKE) == 1);
+
+  // LED Kurulumu
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(ledBrightness);
+// 🔥 F1 STYLE START SEQUENCE
+
+FastLED.clear();
+FastLED.show();
+
+// 0️⃣ SAĞ SOL WHITE FLASH (3 kere çakar)
+for(int i=0;i<3;i++){
+
+  FastLED.clear();
+
+  leds[0] = CRGB::Blue;
+  leds[NUM_LEDS-1] = CRGB::Blue;
+
+  FastLED.show();
+  delay(120);
+
+  FastLED.clear();
+  FastLED.show();
+  delay(70);
+}
+
+
+// 2️⃣ DIŞTAN MERKEZE RED BUILD
+for(int i = 0; i < NUM_LEDS/2; i++){
+
+  leds[i] = CRGB::Red;
+  leds[NUM_LEDS - 1 - i] = CRGB::Red;
+
+  FastLED.show();
+  delay(70);
+}
+
+// 3️⃣ MERKEZ GREEN READY
+FastLED.clear();
+
+leds[centerLeft]  = CRGB::Green;
+leds[centerRight] = CRGB::Green;
+
+FastLED.show();
+delay(350);
+
+// 4️⃣ LED OFF
+FastLED.clear();
+FastLED.show();
+
+  // Tasklar ve Mutex
+  dataMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(obdTask, "OBD", 8192, NULL, 1, NULL, 0); 
+  xTaskCreatePinnedToCore(uiTask, "UI", 4096, NULL, 1, NULL, 1);   
+}
+
+/* ================= LOOP (WEB & LED YÖNETİMİ) ================= */
+void loop() {
+  
+  if (!apModeStarted && millis() > 20000) {
+
+  bool wifiOk = false;
+  bool obdOk  = false;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  wifiOk = car.wifiConnected;
+  obdOk  = car.obdConnected;
+  xSemaphoreGive(dataMutex);
+
+  // 🔥 Sadece WiFi hiç bağlanamadıysa AP aç
+  if (!wifiOk) {
+
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_AP);
+
+    WiFi.softAP("EGEA_SHIFT_LIGHT", "12345678");
+
+    setupWebServerRoutes();
+    server.begin();
+
+    apModeStarted = true;
+  }
+}
+
+  // Web Server açıksa istekleri dinle
+  if (apModeStarted) { server.handleClient(); }
+
+  // 🏎️ LED Güncellemesi
+  static unsigned long lastLedUpdate = 0;
+  if (millis() - lastLedUpdate > 10) { // 100 FPS (Titremeyi önler)
+      lastLedUpdate = millis();
+
+      // RPM Verisini Güvenli Şekilde Çek
+      float currentRpm = 0;
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      currentRpm = car.rpm;
+      xSemaphoreGive(dataMutex);
+
+      if(allowFakeRPM) currentRpm = getFakeRPM();
+
+     // 🔥 Ultra Minimal Smart Interpolation
+     // 🔥 OBD durumunu kontrol et
+bool obdOk = false;
+xSemaphoreTake(dataMutex, portMAX_DELAY);
+obdOk = car.obdConnected;
+xSemaphoreGive(dataMutex);
+
+if(!obdOk && !allowFakeRPM) {
+
+    // OBD yok ve fake kapalı → RPM sabit 0
+    displayRpm = 0;
+
+} else {
+
+    float diff = currentRpm - displayRpm;
+
+    // Büyük fark → direkt atla
+    if (abs(diff) > 400) {
+        displayRpm = currentRpm;
+    }
+    else {
+        displayRpm += diff * 0.25;
+    }
+
+    // Mikro canlılık sadece gerçek bağlantı varsa
+    if (obdOk && currentRpm < 1200 && abs(diff) < 50) {
+        displayRpm += sin(millis() * 0.008) * 1.5;
+    }
+}
+
+displayRpm = constrain(displayRpm, 0, 7500);
+
+int rpmToUse = (int)displayRpm;
+
+
+      switch (currentMode) {
+        case MODE_AERO:   aeroStrobe(); break;
+        case MODE_KNIGHT: knightRider(); break;
+        case MODE_DEMO:   fill_rainbow(leds, NUM_LEDS, hue++, 18); break;
+        case MODE_HEART:  heartbeatEffect(); break;
+        case MODE_GLITCH: cyberpunkGlitch(); break;
+        case MODE_RAIN:   raindropEffect(); break;
+        case MODE_GUNLUK: gunluk(rpmToUse); break;
+        case MODE_LINEAR: linearFill((int)currentRpm); break;
+        case MODE_REVERSE: 
+             if (currentRpm >= rpmRedEnd) { reverseShiftStrobe(); } 
+             else {
+                 FastLED.clear();
+                 if (currentRpm >= rpmStart) {
+                     int lvl = map(constrain((int)currentRpm, rpmStart, rpmRedEnd), rpmStart, rpmRedEnd, 1, 4);
+                     for (int i=0; i<lvl; i++) { leds[i] = CRGB::Blue; leds[NUM_LEDS-1-i] = CRGB::Blue; }
+                 }
+             } break;
+        case MODE_CADDE:  
+             if (currentRpm < rpmStart) {
+                 if (millis() - lastChaseTime > 130) {
+                     lastChaseTime = millis(); fadeToBlackBy(leds, NUM_LEDS, 120);
+                     leds[chaseIndex] = CHSV(hue++, 255, 255); chaseIndex = (chaseIndex + 1) % NUM_LEDS;
+                 }
+             } else { gunluk((int)currentRpm); } break;
+        case MODE_SPORT: 
+             FastLED.clear();
+             if (currentRpm >= rpmRedEnd) { shiftStrobe(); }
+             else if (currentRpm >= rpmStart) {
+                 int sideLeds = map(constrain((int)currentRpm, rpmStart, rpmRedEnd), rpmStart, rpmRedEnd, 1, 4);
+                 for (int i = 0; i < sideLeds; i++) {
+                     CRGB color = (currentRpm < rpmGreenEnd) ? CRGB::Green : (currentRpm < rpmYellowEnd ? CRGB::Yellow : CRGB::Red);
+                     leds[i] = color; leds[NUM_LEDS - 1 - i] = color;
+                 }
+             } break;
+      }
+      FastLED.show();
+  }
+}
+
