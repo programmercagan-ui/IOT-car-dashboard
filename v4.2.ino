@@ -1,4 +1,4 @@
-#include <FS.h>        // 🔥 BU SATIRI EN ÜSTE EKLEDİK
+#include <FS.h>      
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
