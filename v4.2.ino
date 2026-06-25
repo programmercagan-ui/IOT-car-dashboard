@@ -92,7 +92,7 @@ typedef struct {
   float maxSpeed;
   float maxBoost;
 
-  // 🔥 TELEMETRİ VERİLERİ (10 ADET) 🔥
+  
   // Hızlı Güncellenenler
   int engineLoad;     
   int throttlePos;    
@@ -438,13 +438,12 @@ void drawDashboardMinimal(CarData d) {
   // --- FLASH (ÇAKAR) ZAMANLAMASI ---
   bool flashOn = (millis() / 100) % 2; 
 
-  // 🔥 1. ÜST: RPM (TAM MERKEZ 160 - BEYAZ) 🔥
+  
   sprite.setTextDatum(CC_DATUM);
   sprite.setTextColor(TFT_WHITE); // RPM Artık Beyaz
   sprite.setTextFont(4);
   sprite.drawString(String((int)d.rpm) + " RPM", 160, 20); 
 
-  // 🔥 2. TAM BOY YATAY ÇİZGİ 🔥
   // Shift devri geldiyse yanıp söner, gelmediyse sabit kırmızı
   uint16_t currentLineCol = TFT_RED;
   if (d.rpm >= rpmRedEnd && !flashOn) currentLineCol = TFT_BLACK;
