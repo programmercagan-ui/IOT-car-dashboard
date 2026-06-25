@@ -4,9 +4,8 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <FastLED.h>
-#define BUTTON_PIN 4      // ESP32 üzerindeki BOOT tuşu (İstersen harici pin yazabilirsin)
-int dashMode = 0;         // 0: Senin Klasik Mavi Kutulu Tasarım, 1: Yeni Race Tasarımı
-
+#define BUTTON_PIN 4      
+int dashMode = 0;         
 
 /* ================= EKRAN AYARLARI ================= */
 TFT_eSPI tft = TFT_eSPI();
